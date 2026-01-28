@@ -1,0 +1,6 @@
+# Semgrep configuration for SAST scanning
+rules:
+  - id: security-audit
+    languages: [typescript, javascript]
+    severity: ERROR
+
