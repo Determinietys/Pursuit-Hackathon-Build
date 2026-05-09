@@ -1,0 +1,94 @@
+name: BUILDWRIGHT — Build Health Probe
+
+on:
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/buildwright.yml'
+      - '.github/actions/envoy-diagnose/**'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  buildwright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Probe — npm ci
+        id: probe_install
+        continue-on-error: true
+        run: npm ci 2>&1 | tee /tmp/probe_install.log
+
+      - name: Probe — prisma validate
+        id: probe_prisma_validate
+        continue-on-error: true
+        env:
+          DATABASE_URL: postgresql://placeholder/placeholder
+        run: npx prisma validate 2>&1 | tee /tmp/probe_prisma_validate.log
+
+      - name: Probe — TypeScript type check
+        id: probe_typecheck
+        continue-on-error: true
+        run: npx tsc --noEmit 2>&1 | tee /tmp/probe_typecheck.log
+
+      - name: Probe — npm run build
+        id: probe_build
+        continue-on-error: true
+        run: npm run build 2>&1 | tee /tmp/probe_build.log
+
+      - name: Aggregate probe results
+        id: aggregate
+        run: |
+          # NOTE: This aggregate step is simplified — it always
+          # passes the probe results to ENVOY. Customize per stack
+          # if you want different aggregation logic.
+          {
+            echo "BUILDWRIGHT probe results — $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo "Repo: ${{ github.repository }}"
+            echo ""
+            for log in /tmp/probe_*.log; do
+              [ -f "$log" ] && {
+                echo "=== $log ==="
+                tail -50 "$log"
+                echo ""
+              }
+            done
+          } > /tmp/probe_report.txt
+
+          # Detect any non-zero exit by checking for "error|fail" in last lines
+          if grep -qiE "error|fail|exit code [1-9]" /tmp/probe_report.txt; then
+            echo "failed_count=1" >> $GITHUB_OUTPUT
+          else
+            echo "failed_count=0" >> $GITHUB_OUTPUT
+          fi
+
+      - name: ENVOY diagnose
+        if: steps.aggregate.outputs.failed_count != '0'
+        uses: ./.github/actions/envoy-diagnose
+        with:
+          report-file: /tmp/probe_report.txt
+          agent-name: BUILDWRIGHT
+          venture: pursuithackathon
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ github.token }}
+          run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Success summary
+        if: steps.aggregate.outputs.failed_count == '0'
+        run: |
+          echo "BUILDWRIGHT probes passed."
+          date -u +'%Y-%m-%d %H:%M UTC — pursuithackathon build healthy'

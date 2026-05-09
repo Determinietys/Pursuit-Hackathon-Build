@@ -1,0 +1,153 @@
+name: 'ENVOY Diagnose'
+description: 'Calls Anthropic API with ENVOY system prompt, parses Universal Output Contract, files GitHub issue with severity label and paste-ready fix commands'
+author: 'BluPreserva HELOS'
+
+inputs:
+  report-file:
+    description: 'Path to the probe report file to diagnose'
+    required: true
+  agent-name:
+    description: 'Name of the calling agent (e.g. BUILDWRIGHT, VIGIL)'
+    required: true
+  venture:
+    description: 'Venture registry key'
+    required: false
+    default: 'pursuithackathon'
+  repo-path:
+    description: 'Local path of the repo on the operators machine, used in FIX command prefixes'
+    required: false
+    default: '/Users/rafyblu/Desktop/HeLos/Pursuit-Hackathon-Build'
+  anthropic-api-key:
+    description: 'Anthropic API key for ENVOY call'
+    required: true
+  github-token:
+    description: 'GitHub token for issue creation'
+    required: true
+  run-url:
+    description: 'URL of the calling workflow run, for issue body'
+    required: true
+
+outputs:
+  severity:
+    description: 'Severity parsed from ENVOY response (P0/P1/P2/P3)'
+    value: ${{ steps.envoy.outputs.severity }}
+  issue-number:
+    description: 'Number of the issue that was created or commented on'
+    value: ${{ steps.file_issue.outputs.issue_number }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Write ENVOY system prompt to file
+      shell: bash
+      env:
+        REPO_PATH: ${{ inputs.repo-path }}
+      run: |
+        cat > /tmp/envoy_system.txt << PROMPT_END
+        You are ENVOY, the integration and build guardian for BluPreserva Industries. You are part of HELOS. The philosophy: Tuesday lives on, ventures are rescue missions, insight is not action. Reply ONLY in the Universal Output Contract format below. No preamble, no closing, no markdown formatting.
+
+        OUTPUT FORMAT (use these exact labels, plain text):
+        SEVERITY: P0 or P1 or P2 or P3
+        VENTURE: the registry key
+        THIRD_PARTY: name of impacted system or "internal"
+        PROBLEM: one sentence
+        WHO_HURT: which user is affected, or "no current user impact"
+        DIAGNOSIS: root cause with evidence cited from the input
+        FIX: a paste-ready shell command block (see FIX RULES below)
+        RISK: what could go wrong with the fix, or "low" with reason
+        VERIFY: one shell command that proves the fix worked
+        ESCALATE: yes with reason, OR no
+
+        SEVERITY RUBRIC:
+        P0 = a person we built this for is being failed RIGHT NOW.
+        P1 = a person will be failed within 24h if not fixed.
+        P2 = degraded experience, no one stranded.
+        P3 = cleanup, naming, tech debt.
+
+        FIX RULES (CRITICAL — operator copy-pastes the FIX field directly):
+        1. ALWAYS start with: cd \${REPO_PATH} && \\\\
+        2. Chain commands with && \\\\ at end of each line.
+        3. End with git commit and git push, with "Closes #ISSUE" placeholder.
+        4. Use sed -i '' on macOS (BSD sed) for in-place edits.
+        5. For multi-line edits, output a Manual edit required block with cursor command.
+        6. NEVER include destructive commands without ESCALATE: yes.
+        7. NEVER include credentials in the FIX block.
+        8. If the fix is "do nothing" — write FIX: # No action needed.
+
+        The calling agent will be identified in the input.
+        PROMPT_END
+
+    - name: Call ENVOY for diagnosis
+      id: envoy
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        REPORT_FILE: ${{ inputs.report-file }}
+        AGENT_NAME: ${{ inputs.agent-name }}
+        VENTURE: ${{ inputs.venture }}
+      run: |
+        {
+          echo "=== Agent: $AGENT_NAME ==="
+          echo "=== Venture: $VENTURE ==="
+          echo ""
+          cat "$REPORT_FILE"
+        } > /tmp/envoy_input.txt
+
+        REPORT_TRUNC=$(head -c 12000 /tmp/envoy_input.txt)
+        SYSTEM_PROMPT=$(cat /tmp/envoy_system.txt)
+
+        PAYLOAD=$(jq -n --arg system "$SYSTEM_PROMPT" --arg user "$REPORT_TRUNC" '{model: "claude-sonnet-4-5-20250929", max_tokens: 1500, system: $system, messages: [{role: "user", content: $user}]}')
+
+        RESPONSE=$(curl -sS https://api.anthropic.com/v1/messages \
+          -H "x-api-key: $ANTHROPIC_API_KEY" \
+          -H "anthropic-version: 2023-06-01" \
+          -H "content-type: application/json" \
+          -d "$PAYLOAD")
+
+        DIAGNOSIS=$(echo "$RESPONSE" | jq -r '.content[0].text // .error.message // "No response from ENVOY"')
+        SEVERITY=$(echo "$DIAGNOSIS" | grep -oE 'SEVERITY: P[0-3]' | head -1 | grep -oE 'P[0-3]' || echo "P2")
+
+        echo "$DIAGNOSIS" > /tmp/envoy_diagnosis.txt
+        echo "severity=$SEVERITY" >> $GITHUB_OUTPUT
+
+    - name: File issue with ENVOY diagnosis
+      id: file_issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        SEVERITY: ${{ steps.envoy.outputs.severity }}
+        RUN_URL: ${{ inputs.run-url }}
+        AGENT_NAME: ${{ inputs.agent-name }}
+      run: |
+        DATE_VAL=$(date -u +'%Y-%m-%d')
+        DATE_FULL=$(date -u +'%Y-%m-%d %H:%M UTC')
+        SHA=$(git rev-parse --short HEAD)
+        TITLE="$AGENT_NAME $DATE_VAL: probe failure on $SHA"
+        AGENT_LABEL=$(echo "$AGENT_NAME" | tr '[:upper:]' '[:lower:]')
+
+        {
+          echo "**Auto-filed by $AGENT_NAME** on $DATE_FULL"
+          echo ""
+          echo "Workflow run: $RUN_URL"
+          echo ""
+          echo "## ENVOY Diagnosis"
+          echo ""
+          echo '```'
+          cat /tmp/envoy_diagnosis.txt
+          echo '```'
+          echo ""
+          echo "**To apply the fix:** copy the FIX block, replace #ISSUE with this issue number, paste in terminal."
+          echo ""
+          echo "_Auto-filed by $AGENT_NAME via envoy-diagnose composite action. Tuesday lives on._"
+        } > /tmp/issue_body.txt
+
+        EXISTING=$(gh issue list --search "$AGENT_NAME $DATE_VAL in:title state:open" --json number --jq '.[0].number // empty')
+
+        if [ -n "$EXISTING" ]; then
+          gh issue comment "$EXISTING" --body-file /tmp/issue_body.txt
+          echo "issue_number=$EXISTING" >> $GITHUB_OUTPUT
+        else
+          NEW_ISSUE=$(gh issue create --title "$TITLE" --label "$SEVERITY,$AGENT_LABEL,auto-filed" --body-file /tmp/issue_body.txt)
+          ISSUE_NUM=$(echo "$NEW_ISSUE" | grep -oE '/issues/[0-9]+$' | grep -oE '[0-9]+$')
+          echo "issue_number=$ISSUE_NUM" >> $GITHUB_OUTPUT
+        fi

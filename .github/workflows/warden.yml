@@ -1,0 +1,48 @@
+name: WARDEN — Compliance and Accessibility Probe
+
+# STATUS: STUB. workflow_dispatch only — no cron until probes are real.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/warden.yml'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  warden:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Probe — placeholder
+        id: probe_main
+        continue-on-error: true
+        run: echo "STUB: WARDEN probes not yet implemented" | tee /tmp/probe_main.log
+
+      - name: Aggregate probe results
+        id: aggregate
+        run: |
+          echo "failed_count=0" >> $GITHUB_OUTPUT
+          echo "WARDEN stub — probes are placeholders" > /tmp/probe_report.txt
+
+      - name: ENVOY diagnose
+        if: steps.aggregate.outputs.failed_count != '0'
+        uses: ./.github/actions/envoy-diagnose
+        with:
+          report-file: /tmp/probe_report.txt
+          agent-name: WARDEN
+          venture: pursuithackathon
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github-token: ${{ github.token }}
+          run-url: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Success summary
+        if: steps.aggregate.outputs.failed_count == '0'
+        run: echo "WARDEN stub completed."
